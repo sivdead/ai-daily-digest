@@ -1,5 +1,7 @@
 # AI Daily Digest
 
+skill 制作详情可查看 ➡️ https://mp.weixin.qq.com/s/rkQ28KTZs5QeZqjwSCvR4Q
+
 从 [Andrej Karpathy](https://x.com/karpathy) 推荐的 90 个 Hacker News 顶级技术博客中抓取最新文章，通过 Gemini AI 多维评分筛选，生成一份结构化的每日精选日报。
 
 ![AI Daily Digest 概览](assets/overview.png)
