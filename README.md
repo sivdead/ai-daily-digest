@@ -2,7 +2,7 @@
 
 skill 制作详情可查看 ➡️ https://mp.weixin.qq.com/s/rkQ28KTZs5QeZqjwSCvR4Q
 
-从 [Andrej Karpathy](https://x.com/karpathy) 推荐的 90 个 Hacker News 顶级技术博客中抓取最新文章，通过 Gemini AI 多维评分筛选，生成一份结构化的每日精选日报。
+从 [Andrej Karpathy](https://x.com/karpathy) 推荐的 90 个 Hacker News 顶级技术博客中抓取最新文章，通过 AI 多维评分筛选，生成一份结构化的每日精选日报。默认使用 Gemini，并支持自动降级到 OpenAI 兼容 API。
 
 ![AI Daily Digest 概览](assets/overview.png)
 
@@ -31,6 +31,9 @@ Agent 会依次询问：
 
 ```bash
 export GEMINI_API_KEY="your-key"
+export OPENAI_API_KEY="your-openai-compatible-key"  # 可选，Gemini 失败时兜底
+export OPENAI_API_BASE="https://api.deepseek.com/v1" # 可选，默认 https://api.openai.com/v1
+export OPENAI_MODEL="deepseek-chat"                  # 可选，不填会自动推断
 npx -y bun scripts/digest.ts --hours 48 --top-n 15 --lang zh --output ./digest.md
 ```
 
@@ -44,7 +47,7 @@ RSS 抓取 → 时间过滤 → AI 评分+分类 → AI 摘要+翻译 → 趋势
 
 1. **RSS 抓取** — 并发抓取 90 个源（10 路并发，15s 超时），兼容 RSS 2.0 和 Atom 格式
 2. **时间过滤** — 按指定时间窗口筛选近期文章
-3. **AI 评分** — Gemini 从相关性、质量、时效性三个维度打分（1-10），同时完成分类和关键词提取
+3. **AI 评分** — AI 从相关性、质量、时效性三个维度打分（1-10），同时完成分类和关键词提取（Gemini 优先，失败自动降级到 OpenAI 兼容接口）
 4. **AI 摘要** — 为 Top N 文章生成结构化摘要（4-6 句）、中文标题翻译、推荐理由
 5. **趋势总结** — AI 归纳当日技术圈 2-3 个宏观趋势
 
@@ -83,7 +86,9 @@ RSS 抓取 → 时间过滤 → AI 评分+分类 → AI 摘要+翻译 → 趋势
 ## 环境要求
 
 - [Bun](https://bun.sh) 运行时（通过 `npx -y bun` 自动安装）
-- Gemini API Key（[免费获取](https://aistudio.google.com/apikey)）
+- 至少一个可用的 AI API Key：
+  - `GEMINI_API_KEY`（[免费获取](https://aistudio.google.com/apikey)）
+  - 或 `OPENAI_API_KEY`（可配合 `OPENAI_API_BASE` 使用 DeepSeek / OpenAI 等 OpenAI 兼容服务）
 - 网络连接
 
 ## 信息源

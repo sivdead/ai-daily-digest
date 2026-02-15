@@ -7,6 +7,8 @@ import process from 'node:process';
 // ============================================================================
 
 const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
+const OPENAI_DEFAULT_API_BASE = 'https://api.openai.com/v1';
+const OPENAI_DEFAULT_MODEL = 'gpt-4o-mini';
 const FEED_FETCH_TIMEOUT_MS = 15_000;
 const FEED_CONCURRENCY = 10;
 const GEMINI_BATCH_SIZE = 10;
@@ -164,6 +166,10 @@ interface GeminiSummaryResult {
     summary: string;
     reason: string;
   }>;
+}
+
+interface AIClient {
+  call(prompt: string): Promise<string>;
 }
 
 // ============================================================================
@@ -357,7 +363,7 @@ async function fetchAllFeeds(feeds: typeof RSS_FEEDS): Promise<Article[]> {
 }
 
 // ============================================================================
-// Gemini API
+// AI Providers (Gemini + OpenAI-compatible fallback)
 // ============================================================================
 
 async function callGemini(prompt: string, apiKey: string): Promise<string> {
@@ -386,6 +392,104 @@ async function callGemini(prompt: string, apiKey: string): Promise<string> {
   };
   
   return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+}
+
+async function callOpenAICompatible(
+  prompt: string,
+  apiKey: string,
+  apiBase: string,
+  model: string
+): Promise<string> {
+  const normalizedBase = apiBase.replace(/\/+$/, '');
+  const response = await fetch(`${normalizedBase}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.3,
+      top_p: 0.8,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => 'Unknown error');
+    throw new Error(`OpenAI-compatible API error (${response.status}): ${errorText}`);
+  }
+
+  const data = await response.json() as {
+    choices?: Array<{
+      message?: {
+        content?: string | Array<{ type?: string; text?: string }>;
+      };
+    }>;
+  };
+
+  const content = data.choices?.[0]?.message?.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter(item => item.type === 'text' && typeof item.text === 'string')
+      .map(item => item.text)
+      .join('\n');
+  }
+  return '';
+}
+
+function inferOpenAIModel(apiBase: string): string {
+  const base = apiBase.toLowerCase();
+  if (base.includes('deepseek')) return 'deepseek-chat';
+  return OPENAI_DEFAULT_MODEL;
+}
+
+function createAIClient(config: {
+  geminiApiKey?: string;
+  openaiApiKey?: string;
+  openaiApiBase?: string;
+  openaiModel?: string;
+}): AIClient {
+  const state = {
+    geminiApiKey: config.geminiApiKey?.trim() || '',
+    openaiApiKey: config.openaiApiKey?.trim() || '',
+    openaiApiBase: (config.openaiApiBase?.trim() || OPENAI_DEFAULT_API_BASE).replace(/\/+$/, ''),
+    openaiModel: config.openaiModel?.trim() || '',
+    geminiEnabled: Boolean(config.geminiApiKey?.trim()),
+    fallbackLogged: false,
+  };
+
+  if (!state.openaiModel) {
+    state.openaiModel = inferOpenAIModel(state.openaiApiBase);
+  }
+
+  return {
+    async call(prompt: string): Promise<string> {
+      if (state.geminiEnabled && state.geminiApiKey) {
+        try {
+          return await callGemini(prompt, state.geminiApiKey);
+        } catch (error) {
+          if (state.openaiApiKey) {
+            if (!state.fallbackLogged) {
+              const reason = error instanceof Error ? error.message : String(error);
+              console.warn(`[digest] Gemini failed, switching to OpenAI-compatible fallback (${state.openaiApiBase}, model=${state.openaiModel}). Reason: ${reason}`);
+              state.fallbackLogged = true;
+            }
+            state.geminiEnabled = false;
+            return callOpenAICompatible(prompt, state.openaiApiKey, state.openaiApiBase, state.openaiModel);
+          }
+          throw error;
+        }
+      }
+
+      if (state.openaiApiKey) {
+        return callOpenAICompatible(prompt, state.openaiApiKey, state.openaiApiBase, state.openaiModel);
+      }
+
+      throw new Error('No AI API key configured. Set GEMINI_API_KEY and/or OPENAI_API_KEY.');
+    },
+  };
 }
 
 function parseJsonResponse<T>(text: string): T {
@@ -462,7 +566,7 @@ ${articlesList}
 
 async function scoreArticlesWithAI(
   articles: Article[],
-  apiKey: string
+  aiClient: AIClient
 ): Promise<Map<number, { relevance: number; quality: number; timeliness: number; category: CategoryId; keywords: string[] }>> {
   const allScores = new Map<number, { relevance: number; quality: number; timeliness: number; category: CategoryId; keywords: string[] }>();
   
@@ -487,7 +591,7 @@ async function scoreArticlesWithAI(
     const promises = batchGroup.map(async (batch) => {
       try {
         const prompt = buildScoringPrompt(batch);
-        const responseText = await callGemini(prompt, apiKey);
+        const responseText = await aiClient.call(prompt);
         const parsed = parseJsonResponse<GeminiScoringResult>(responseText);
         
         if (parsed.results && Array.isArray(parsed.results)) {
@@ -571,7 +675,7 @@ ${articlesList}
 
 async function summarizeArticles(
   articles: Array<Article & { index: number }>,
-  apiKey: string,
+  aiClient: AIClient,
   lang: 'zh' | 'en'
 ): Promise<Map<number, { titleZh: string; summary: string; reason: string }>> {
   const summaries = new Map<number, { titleZh: string; summary: string; reason: string }>();
@@ -596,7 +700,7 @@ async function summarizeArticles(
     const promises = batchGroup.map(async (batch) => {
       try {
         const prompt = buildSummaryPrompt(batch, lang);
-        const responseText = await callGemini(prompt, apiKey);
+        const responseText = await aiClient.call(prompt);
         const parsed = parseJsonResponse<GeminiSummaryResult>(responseText);
         
         if (parsed.results && Array.isArray(parsed.results)) {
@@ -629,7 +733,7 @@ async function summarizeArticles(
 
 async function generateHighlights(
   articles: ScoredArticle[],
-  apiKey: string,
+  aiClient: AIClient,
   lang: 'zh' | 'en'
 ): Promise<string> {
   const articleList = articles.slice(0, 10).map((a, i) =>
@@ -651,7 +755,7 @@ ${articleList}
 直接返回纯文本总结，不要 JSON，不要 markdown 格式。`;
 
   try {
-    const text = await callGemini(prompt, apiKey);
+    const text = await aiClient.call(prompt);
     return text.trim();
   } catch (error) {
     console.warn(`[digest] Highlights generation failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -908,7 +1012,10 @@ Options:
   --help          Show this help
 
 Environment:
-  GEMINI_API_KEY  Required. Get one at https://aistudio.google.com/apikey
+  GEMINI_API_KEY   Optional but recommended. Get one at https://aistudio.google.com/apikey
+  OPENAI_API_KEY   Optional fallback key for OpenAI-compatible APIs
+  OPENAI_API_BASE  Optional fallback base URL (default: https://api.openai.com/v1)
+  OPENAI_MODEL     Optional fallback model (default: deepseek-chat for DeepSeek base, else gpt-4o-mini)
 
 Examples:
   bun scripts/digest.ts --hours 24 --top-n 10 --lang zh
@@ -939,12 +1046,23 @@ async function main(): Promise<void> {
     }
   }
   
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    console.error('[digest] Error: GEMINI_API_KEY environment variable is required.');
-    console.error('[digest] Get one at: https://aistudio.google.com/apikey');
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+  const openaiApiKey = process.env.OPENAI_API_KEY;
+  const openaiApiBase = process.env.OPENAI_API_BASE;
+  const openaiModel = process.env.OPENAI_MODEL;
+
+  if (!geminiApiKey && !openaiApiKey) {
+    console.error('[digest] Error: Missing API key. Set GEMINI_API_KEY and/or OPENAI_API_KEY.');
+    console.error('[digest] Gemini key: https://aistudio.google.com/apikey');
     process.exit(1);
   }
+
+  const aiClient = createAIClient({
+    geminiApiKey,
+    openaiApiKey,
+    openaiApiBase,
+    openaiModel,
+  });
   
   if (!outputPath) {
     const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
@@ -956,6 +1074,12 @@ async function main(): Promise<void> {
   console.log(`[digest] Top N: ${topN}`);
   console.log(`[digest] Language: ${lang}`);
   console.log(`[digest] Output: ${outputPath}`);
+  console.log(`[digest] AI provider: ${geminiApiKey ? 'Gemini (primary)' : 'OpenAI-compatible (primary)'}`);
+  if (openaiApiKey) {
+    const resolvedBase = (openaiApiBase?.trim() || OPENAI_DEFAULT_API_BASE).replace(/\/+$/, '');
+    const resolvedModel = openaiModel?.trim() || inferOpenAIModel(resolvedBase);
+    console.log(`[digest] Fallback: ${resolvedBase} (model=${resolvedModel})`);
+  }
   console.log('');
   
   console.log(`[digest] Step 1/5: Fetching ${RSS_FEEDS.length} RSS feeds...`);
@@ -979,7 +1103,7 @@ async function main(): Promise<void> {
   }
   
   console.log(`[digest] Step 3/5: AI scoring ${recentArticles.length} articles...`);
-  const scores = await scoreArticlesWithAI(recentArticles, apiKey);
+  const scores = await scoreArticlesWithAI(recentArticles, aiClient);
   
   const scoredArticles = recentArticles.map((article, index) => {
     const score = scores.get(index) || { relevance: 5, quality: 5, timeliness: 5, category: 'other' as CategoryId, keywords: [] };
@@ -997,7 +1121,7 @@ async function main(): Promise<void> {
   
   console.log(`[digest] Step 4/5: Generating AI summaries...`);
   const indexedTopArticles = topArticles.map((a, i) => ({ ...a, index: i }));
-  const summaries = await summarizeArticles(indexedTopArticles, apiKey, lang);
+  const summaries = await summarizeArticles(indexedTopArticles, aiClient, lang);
   
   const finalArticles: ScoredArticle[] = topArticles.map((a, i) => {
     const sm = summaries.get(i) || { titleZh: a.title, summary: a.description.slice(0, 200), reason: '' };
@@ -1023,7 +1147,7 @@ async function main(): Promise<void> {
   });
   
   console.log(`[digest] Step 5/5: Generating today's highlights...`);
-  const highlights = await generateHighlights(finalArticles, apiKey, lang);
+  const highlights = await generateHighlights(finalArticles, aiClient, lang);
   
   const successfulSources = new Set(allArticles.map(a => a.sourceName));
   

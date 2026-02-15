@@ -122,7 +122,7 @@ question({
 })
 ```
 
-### Step 1b: Gemini API Key
+### Step 1b: AI API Key（Gemini 优先，支持兜底）
 
 如果配置中没有已保存的 API Key，询问：
 
@@ -130,7 +130,7 @@ question({
 question({
   questions: [{
     header: "Gemini API Key",
-    question: "需要 Gemini API Key 进行 AI 评分和摘要\n\n获取方式：访问 https://aistudio.google.com/apikey 创建免费 API Key",
+    question: "推荐提供 Gemini API Key 作为主模型（可选再配置 OPENAI_API_KEY 兜底）\n\n获取方式：访问 https://aistudio.google.com/apikey 创建免费 API Key",
     options: []
   }]
 })
@@ -144,6 +144,10 @@ question({
 mkdir -p ./output
 
 export GEMINI_API_KEY="<key>"
+# 可选：OpenAI 兼容兜底（DeepSeek/OpenAI 等）
+export OPENAI_API_KEY="<fallback-key>"
+export OPENAI_API_BASE="https://api.deepseek.com/v1"
+export OPENAI_MODEL="deepseek-chat"
 
 npx -y bun ${SKILL_DIR}/scripts/digest.ts \
   --hours <timeRange> \
@@ -205,8 +209,9 @@ EOF
 ## 环境要求
 
 - `bun` 运行时（通过 `npx -y bun` 自动安装）
-- GEMINI_API_KEY 环境变量
-- 网络访问（需要能访问 RSS 源和 Gemini API）
+- 至少一个 AI API Key（`GEMINI_API_KEY` 或 `OPENAI_API_KEY`）
+- 可选：`OPENAI_API_BASE`、`OPENAI_MODEL`（用于 OpenAI 兼容接口）
+- 网络访问（需要能访问 RSS 源和 AI API）
 
 ---
 
@@ -224,6 +229,9 @@ EOF
 
 ### "GEMINI_API_KEY not set"
 需要提供 Gemini API Key，可在 https://aistudio.google.com/apikey 免费获取。
+
+### "Gemini 配额超限或请求失败"
+脚本会自动降级到 OpenAI 兼容接口（需提供 `OPENAI_API_KEY`，可选 `OPENAI_API_BASE`）。
 
 ### "Failed to fetch N feeds"
 部分 RSS 源可能暂时不可用，脚本会跳过失败的源并继续处理。
