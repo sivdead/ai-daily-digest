@@ -86,6 +86,52 @@ RSS 抓取 → 时间过滤 → AI 评分+分类 → AI 摘要+翻译 → 趋势
 - Gemini API Key（[免费获取](https://aistudio.google.com/apikey)）
 - 网络连接
 
+## 切换 AI 模型提供商
+
+本项目默认使用 Gemini API（免费），如果你希望替换为其他模型提供商（如 OpenAI、Anthropic、DeepSeek、通义千问等），可以借助 AI 编码助手一键完成。
+
+### 方法：让 AI 帮你改
+
+在你使用的 AI 编码工具（如 Claude Code、Cursor、GitHub Copilot 等）中，直接发送以下 prompt：
+
+```
+请修改 scripts/digest.ts，将 AI 提供商从 Gemini 替换为 [你想用的提供商]。
+
+需要修改的部分：
+1. 常量 GEMINI_API_URL（第 9 行）— 替换为目标 API 的 endpoint
+2. 函数 callGemini（约第 363 行）— 修改 request body 格式和 response 解析逻辑以适配目标 API
+3. 环境变量名 GEMINI_API_KEY — 改为对应的 key 名称（如 OPENAI_API_KEY）
+4. SKILL.md 和 README.md 中的相关说明文字
+
+要求：
+- 保持函数签名不变（输入 prompt 字符串，返回 string）
+- 保持 temperature 等参数的语义等价
+- 更新 CLI 帮助文本和错误提示中的 key 名称
+```
+
+### 改动范围说明
+
+整个项目只有一个脚本文件 `scripts/digest.ts`，AI 调用逻辑集中在两处：
+
+| 位置 | 说明 |
+|------|------|
+| `GEMINI_API_URL` 常量 | API endpoint 地址 |
+| `callGemini()` 函数 | 请求构造 + 响应解析，约 25 行代码 |
+
+其余所有代码（RSS 抓取、评分 prompt、摘要 prompt、报告生成）均与 AI 提供商无关，无需修改。Prompt 内容本身是通用的，切换模型后可以直接复用。
+
+### 常见替换示例
+
+| 提供商 | API Endpoint | Key 环境变量 |
+|--------|-------------|-------------|
+| OpenAI | `https://api.openai.com/v1/chat/completions` | `OPENAI_API_KEY` |
+| Anthropic | `https://api.anthropic.com/v1/messages` | `ANTHROPIC_API_KEY` |
+| DeepSeek | `https://api.deepseek.com/v1/chat/completions` | `DEEPSEEK_API_KEY` |
+| 通义千问 | `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions` | `DASHSCOPE_API_KEY` |
+| OpenAI 兼容 API | 自定义 endpoint | 自定义 |
+
+> 💡 如果目标提供商兼容 OpenAI API 格式（如 DeepSeek、Groq、Together AI 等），改动量更小 — 只需换 URL 和 Key，request/response 格式相同。
+
 ## 信息源
 
 90 个 RSS 源精选自 Hacker News 社区最受欢迎的独立技术博客，包括但不限于：
