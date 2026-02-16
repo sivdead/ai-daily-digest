@@ -9,9 +9,8 @@ import { join } from 'node:path';
 // Constants
 // ============================================================================
 
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
-const OPENAI_DEFAULT_API_BASE = 'https://api.openai.com/v1';
-const OPENAI_DEFAULT_MODEL = 'gpt-4o-mini';
+const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const OPENROUTER_MODEL = 'google/gemini-2.5-flash-lite';  // or google/gemini-3-flash-preview
 const FEED_FETCH_TIMEOUT_MS = 15_000;
 
 const DB_DIR = join(homedir(), '.hn-daily-digest');
@@ -610,31 +609,37 @@ async function* fetchAllFeedsSerial(feeds: typeof RSS_FEEDS, db: DigestDatabase,
 // ============================================================================
 
 async function callGemini(prompt: string, apiKey: string): Promise<string> {
-  const response = await fetch(`${GEMINI_API_URL}?key=${apiKey}`, {
+  // Use OpenRouter instead of direct Gemini API
+  const response = await fetch(OPENROUTER_API_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+      'HTTP-Referer': 'https://github.com/sivdead/ai-daily-digest',
+      'X-Title': 'AI Daily Digest',
+    },
     body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        temperature: 0.3,
-        topP: 0.8,
-        topK: 40,
-      },
+      model: OPENROUTER_MODEL,
+      messages: [{ role: 'user', content: prompt }],
+      temperature: 0.3,
+      top_p: 0.8,
     }),
   });
   
   if (!response.ok) {
     const errorText = await response.text().catch(() => 'Unknown error');
-    throw new Error(`Gemini API error (${response.status}): ${errorText}`);
+    throw new Error(`OpenRouter API error (${response.status}): ${errorText}`);
   }
   
   const data = await response.json() as {
-    candidates?: Array<{
-      content?: { parts?: Array<{ text?: string }> };
+    choices?: Array<{
+      message?: {
+        content?: string;
+      };
     }>;
   };
   
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  return data.choices?.[0]?.message?.content || '';
 }
 
 async function callOpenAICompatible(
@@ -1253,8 +1258,9 @@ Options:
   --help          Show this help
 
 Environment:
-  GEMINI_API_KEY   Optional but recommended. Get one at https://aistudio.google.com/apikey
-  OPENAI_API_KEY   Optional fallback key for OpenAI-compatible APIs
+  OPENROUTER_API_KEY  Required. Get one at https://openrouter.ai/keys
+  GEMINI_API_KEY      Optional fallback for direct Gemini API
+  OPENAI_API_KEY      Optional fallback for OpenAI-compatible APIs
   OPENAI_API_BASE  Optional fallback base URL (default: https://api.openai.com/v1)
   OPENAI_MODEL     Optional fallback model (default: deepseek-chat for DeepSeek base, else gpt-4o-mini)
 
@@ -1287,14 +1293,14 @@ async function main(): Promise<void> {
     }
   }
   
-  const geminiApiKey = process.env.GEMINI_API_KEY;
+  const geminiApiKey = process.env.OPENROUTER_API_KEY || process.env.GEMINI_API_KEY;
   const openaiApiKey = process.env.OPENAI_API_KEY;
   const openaiApiBase = process.env.OPENAI_API_BASE;
   const openaiModel = process.env.OPENAI_MODEL;
 
   if (!geminiApiKey && !openaiApiKey) {
-    console.error('[digest] Error: Missing API key. Set GEMINI_API_KEY and/or OPENAI_API_KEY.');
-    console.error('[digest] Gemini key: https://aistudio.google.com/apikey');
+    console.error('[digest] Error: Missing API key. Set OPENROUTER_API_KEY or GEMINI_API_KEY.');
+    console.error('[digest] OpenRouter key: https://openrouter.ai/keys');
     process.exit(1);
   }
 
@@ -1319,7 +1325,7 @@ async function main(): Promise<void> {
   console.log(`[digest] Top N: ${topN}`);
   console.log(`[digest] Language: ${lang}`);
   console.log(`[digest] Output: ${outputPath}`);
-  console.log(`[digest] AI provider: ${geminiApiKey ? 'Gemini (primary)' : 'OpenAI-compatible (primary)'}`);
+  console.log(`[digest] AI provider: ${process.env.OPENROUTER_API_KEY ? 'OpenRouter (Gemini via OpenRouter)' : geminiApiKey ? 'Gemini (primary)' : 'OpenAI-compatible (primary)'}`);
   if (openaiApiKey) {
     const resolvedBase = (openaiApiBase?.trim() || OPENAI_DEFAULT_API_BASE).replace(/\/+$/, '');
     const resolvedModel = openaiModel?.trim() || inferOpenAIModel(resolvedBase);
