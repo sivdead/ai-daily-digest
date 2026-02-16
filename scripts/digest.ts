@@ -13,10 +13,6 @@ const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/
 const OPENAI_DEFAULT_API_BASE = 'https://api.openai.com/v1';
 const OPENAI_DEFAULT_MODEL = 'gpt-4o-mini';
 const FEED_FETCH_TIMEOUT_MS = 15_000;
-const FEED_BATCH_SIZE = 5;  // 每批处理 5 个 RSS 源
-const FEED_BATCH_DELAY_MS = 5000;  // 批次之间间隔 5 秒
-const GEMINI_BATCH_SIZE = 10;
-const MAX_CONCURRENT_GEMINI = 1;  // 限制同时处理的 AI 请求数量为 1
 
 const DB_DIR = join(homedir(), '.hn-daily-digest');
 const DB_PATH = join(DB_DIR, 'digest.db');
@@ -156,23 +152,17 @@ interface ScoredArticle extends Article {
 }
 
 interface GeminiScoringResult {
-  results: Array<{
-    index: number;
-    relevance: number;
-    quality: number;
-    timeliness: number;
-    category: string;
-    keywords: string[];
-  }>;
+  relevance: number;
+  quality: number;
+  timeliness: number;
+  category: string;
+  keywords: string[];
 }
 
 interface GeminiSummaryResult {
-  results: Array<{
-    index: number;
-    titleZh: string;
-    summary: string;
-    reason: string;
-  }>;
+  titleZh: string;
+  summary: string;
+  reason: string;
 }
 
 interface AIClient {
@@ -204,7 +194,7 @@ class DigestDatabase {
       )
     `);
 
-    // Articles table
+    // Articles table - create with basic columns first
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS articles (
         url TEXT PRIMARY KEY,
@@ -216,10 +206,35 @@ class DigestDatabase {
       )
     `);
 
+    // Migrate: add new columns if they don't exist
+    this.migrateArticlesTable();
+
     // Create index for faster lookups
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_articles_source ON articles(source)
     `);
+  }
+
+  private migrateArticlesTable(): void {
+    // Check and add new columns one by one
+    const columnsToAdd = [
+      { name: 'relevance', type: 'INTEGER' },
+      { name: 'quality', type: 'INTEGER' },
+      { name: 'timeliness', type: 'INTEGER' },
+      { name: 'category', type: 'TEXT' },
+      { name: 'keywords', type: 'TEXT' },
+      { name: 'title_zh', type: 'TEXT' },
+      { name: 'summary', type: 'TEXT' },
+      { name: 'reason', type: 'TEXT' },
+    ];
+
+    for (const col of columnsToAdd) {
+      try {
+        this.db.exec(`ALTER TABLE articles ADD COLUMN ${col.name} ${col.type}`);
+      } catch {
+        // Column already exists, ignore error
+      }
+    }
   }
 
   // Get last fetch time for a source
@@ -256,16 +271,64 @@ class DigestDatabase {
     return row?.score ?? null;
   }
 
+  // Get existing article with full data
+  getArticle(url: string): { score: number; relevance: number; quality: number; timeliness: number; category: CategoryId; keywords: string[]; titleZh: string; summary: string; reason: string } | null {
+    const stmt = this.db.prepare('SELECT score, relevance, quality, timeliness, category, keywords, title_zh, summary, reason FROM articles WHERE url = ?');
+    const row = stmt.get(url) as { score: number; relevance: number; quality: number; timeliness: number; category: string; keywords: string; title_zh: string; summary: string; reason: string } | undefined;
+    if (!row) return null;
+    return {
+      score: row.score,
+      relevance: row.relevance,
+      quality: row.quality,
+      timeliness: row.timeliness,
+      category: (row.category as CategoryId) || 'other',
+      keywords: row.keywords ? JSON.parse(row.keywords) : [],
+      titleZh: row.title_zh || '',
+      summary: row.summary || '',
+      reason: row.reason || '',
+    };
+  }
+
   // Insert or update article
-  saveArticle(url: string, title: string, source: string, score: number): void {
+  saveArticle(url: string, title: string, source: string, score: number, extra?: {
+    relevance?: number;
+    quality?: number;
+    timeliness?: number;
+    category?: CategoryId;
+    keywords?: string[];
+    titleZh?: string;
+    summary?: string;
+    reason?: string;
+  }): void {
     const stmt = this.db.prepare(`
-      INSERT INTO articles (url, title, source, processed_at, score)
-      VALUES (?, ?, ?, unixepoch(), ?)
+      INSERT INTO articles (url, title, source, processed_at, score, relevance, quality, timeliness, category, keywords, title_zh, summary, reason)
+      VALUES (?, ?, ?, unixepoch(), ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(url) DO UPDATE SET
         processed_at = excluded.processed_at,
-        score = excluded.score
+        score = excluded.score,
+        relevance = COALESCE(excluded.relevance, relevance),
+        quality = COALESCE(excluded.quality, quality),
+        timeliness = COALESCE(excluded.timeliness, timeliness),
+        category = COALESCE(excluded.category, category),
+        keywords = COALESCE(excluded.keywords, keywords),
+        title_zh = COALESCE(excluded.title_zh, title_zh),
+        summary = COALESCE(excluded.summary, summary),
+        reason = COALESCE(excluded.reason, reason)
     `);
-    stmt.run(url, title, source, score);
+    stmt.run(
+      url,
+      title,
+      source,
+      score,
+      extra?.relevance ?? null,
+      extra?.quality ?? null,
+      extra?.timeliness ?? null,
+      extra?.category ?? null,
+      extra?.keywords ? JSON.stringify(extra.keywords) : null,
+      extra?.titleZh ?? null,
+      extra?.summary ?? null,
+      extra?.reason ?? null
+    );
   }
 
   // Get sources that need re-fetching (older than cutoff time)
@@ -277,6 +340,48 @@ class DigestDatabase {
     `);
     const rows = stmt.all(cutoffSeconds) as Array<{ source_name: string }>;
     return rows.map(r => r.source_name);
+  }
+
+  // Get all articles within time range that have been scored
+  getRecentArticles(cutoffTimeMs: number): Array<Article & { score: number; relevance: number; quality: number; timeliness: number; category: CategoryId; keywords: string[]; titleZh: string; summary: string; reason: string }> {
+    const cutoffSeconds = Math.floor(cutoffTimeMs / 1000);
+    const stmt = this.db.prepare(`
+      SELECT url, title, source, score, relevance, quality, timeliness, category, keywords, title_zh, summary, reason, processed_at
+      FROM articles
+      WHERE processed_at >= ? AND score IS NOT NULL
+    `);
+    const rows = stmt.all(cutoffSeconds) as Array<{
+      url: string;
+      title: string;
+      source: string;
+      score: number;
+      relevance: number;
+      quality: number;
+      timeliness: number;
+      category: string;
+      keywords: string;
+      title_zh: string;
+      summary: string;
+      reason: string;
+      processed_at: number;
+    }>;
+    return rows.map(row => ({
+      title: row.title,
+      link: row.url,
+      pubDate: new Date(row.processed_at * 1000),
+      description: '',
+      sourceName: row.source,
+      sourceUrl: '',
+      score: row.score,
+      relevance: row.relevance || 0,
+      quality: row.quality || 0,
+      timeliness: row.timeliness || 0,
+      category: (row.category as CategoryId) || 'other',
+      keywords: row.keywords ? JSON.parse(row.keywords) : [],
+      titleZh: row.title_zh || '',
+      summary: row.summary || '',
+      reason: row.reason || '',
+    }));
   }
 
   close(): void {
@@ -403,7 +508,7 @@ function parseRSSItems(xml: string): Array<{ title: string; link: string; pubDat
 }
 
 // ============================================================================
-// Feed Fetching (Batched with delay)
+// Feed Fetching (Serial - one by one)
 // ============================================================================
 
 async function fetchFeed(feed: { name: string; xmlUrl: string; htmlUrl: string }, db: DigestDatabase): Promise<{ articles: Article[]; status: 'success' | 'failed' | 'timeout' }> {
@@ -437,9 +542,6 @@ async function fetchFeed(feed: { name: string; xmlUrl: string; htmlUrl: string }
       sourceUrl: feed.htmlUrl,
     }));
 
-    // Update database with success status
-    db.updateSourceStatus(feed.name, 'success', Math.floor(Date.now() / 1000));
-    
     return { articles, status: 'success' };
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
@@ -451,51 +553,56 @@ async function fetchFeed(feed: { name: string; xmlUrl: string; htmlUrl: string }
     } else {
       console.warn(`[digest] ✗ ${feed.name}: timeout`);
     }
-
-    // Update database with failure status
-    db.updateSourceStatus(feed.name, status, Math.floor(Date.now() / 1000));
     
     return { articles: [], status };
   }
 }
 
-async function fetchAllFeeds(feeds: typeof RSS_FEEDS, db: DigestDatabase): Promise<Article[]> {
-  const allArticles: Article[] = [];
+// Async generator for serial feed processing - yields articles one by one
+async function* fetchAllFeedsSerial(feeds: typeof RSS_FEEDS, db: DigestDatabase, cutoffTime: Date): AsyncGenerator<{ article: Article; isNew: boolean }, void, unknown> {
   let successCount = 0;
   let failCount = 0;
+  let newCount = 0;
+  let cachedCount = 0;
   
-  for (let i = 0; i < feeds.length; i += FEED_BATCH_SIZE) {
-    const batch = feeds.slice(i, i + FEED_BATCH_SIZE);
-    console.log(`[digest] Fetching batch ${Math.floor(i / FEED_BATCH_SIZE) + 1}/${Math.ceil(feeds.length / FEED_BATCH_SIZE)} (${batch.length} feeds)...`);
+  for (let i = 0; i < feeds.length; i++) {
+    const feed = feeds[i]!;
+    console.log(`[digest] [${i + 1}/${feeds.length}] Fetching ${feed.name}...`);
     
-    const results = await Promise.allSettled(batch.map(feed => fetchFeed(feed, db)));
+    const result = await fetchFeed(feed, db);
     
-    for (const result of results) {
-      if (result.status === 'fulfilled') {
-        if (result.value.articles.length > 0) {
-          allArticles.push(...result.value.articles);
-        }
-        if (result.value.status === 'success') {
-          successCount++;
-        } else {
-          failCount++;
-        }
+    if (result.status === 'success') {
+      successCount++;
+    } else {
+      failCount++;
+    }
+    
+    // Process each article immediately - serially
+    for (const article of result.articles) {
+      // Check if article is within time range
+      if (article.pubDate.getTime() <= cutoffTime.getTime()) {
+        continue; // Skip old articles
+      }
+      
+      // Check if article exists in database
+      const exists = db.articleExists(article.link);
+      
+      if (!exists) {
+        // New article - save to database with initial score
+        db.saveArticle(article.link, article.title, article.sourceName, 0);
+        newCount++;
+        yield { article, isNew: true };
       } else {
-        failCount++;
+        cachedCount++;
+        yield { article, isNew: false };
       }
     }
     
-    const progress = Math.min(i + FEED_BATCH_SIZE, feeds.length);
-    console.log(`[digest] Progress: ${progress}/${feeds.length} feeds processed (${successCount} ok, ${failCount} failed)`);
-    
-    // Delay between batches (except for the last batch)
-    if (i + FEED_BATCH_SIZE < feeds.length) {
-      await new Promise(resolve => setTimeout(resolve, FEED_BATCH_DELAY_MS));
-    }
+    // Update source status immediately after processing
+    db.updateSourceStatus(feed.name, result.status, Math.floor(Date.now() / 1000));
   }
   
-  console.log(`[digest] Fetched ${allArticles.length} articles from ${successCount} feeds (${failCount} failed)`);
-  return allArticles;
+  console.log(`[digest] Fetched from ${successCount} feeds (${failCount} failed), ${newCount} new articles, ${cachedCount} cached`);
 }
 
 // ============================================================================
@@ -638,17 +745,13 @@ function parseJsonResponse<T>(text: string): T {
 }
 
 // ============================================================================
-// AI Scoring (Incremental with database check)
+// AI Scoring (Serial - one article at a time)
 // ============================================================================
 
-function buildScoringPrompt(articles: Array<{ index: number; title: string; description: string; sourceName: string }>): string {
-  const articlesList = articles.map(a =>
-    `Index ${a.index}: [${a.sourceName}] ${a.title}\n${a.description.slice(0, 300)}`
-  ).join('\n\n---\n\n');
-
+function buildSingleScoringPrompt(article: { title: string; description: string; sourceName: string }): string {
   return `你是一个技术内容策展人，正在为一份面向技术爱好者的每日精选摘要筛选文章。
 
-请对以下文章进行三个维度的评分（1-10 整数，10 分最高），并为每篇文章分配一个分类标签和提取 2-4 个关键词。
+请对以下文章进行三个维度的评分（1-10 整数，10 分最高），并分配一个分类标签和提取 2-4 个关键词。
 
 ## 评分维度
 
@@ -683,131 +786,87 @@ function buildScoringPrompt(articles: Array<{ index: number; title: string; desc
 
 ## 待评分文章
 
-${articlesList}
+[${article.sourceName}] ${article.title}
+${article.description.slice(0, 500)}
 
 请严格按 JSON 格式返回，不要包含 markdown 代码块或其他文字：
 {
-  "results": [
-    {
-      "index": 0,
-      "relevance": 8,
-      "quality": 7,
-      "timeliness": 9,
-      "category": "engineering",
-      "keywords": ["Rust", "compiler", "performance"]
-    }
-  ]
+  "relevance": 8,
+  "quality": 7,
+  "timeliness": 9,
+  "category": "engineering",
+  "keywords": ["Rust", "compiler", "performance"]
 }`;
 }
 
-async function scoreArticlesWithAI(
-  articles: Article[],
+async function scoreSingleArticle(
+  article: Article,
   aiClient: AIClient,
   db: DigestDatabase
-): Promise<Map<number, { relevance: number; quality: number; timeliness: number; category: CategoryId; keywords: string[] }>> {
-  const allScores = new Map<number, { relevance: number; quality: number; timeliness: number; category: CategoryId; keywords: string[] }>();
-  
-  // Filter out articles that already exist in database
-  const newArticles: { article: Article; originalIndex: number }[] = [];
-  
-  for (let i = 0; i < articles.length; i++) {
-    const article = articles[i];
-    if (db.articleExists(article.link)) {
-      // Skip existing articles - use cached score
-      const cachedScore = db.getArticleScore(article.link);
-      allScores.set(i, { 
-        relevance: cachedScore ? Math.floor(cachedScore / 3) : 5, 
-        quality: cachedScore ? Math.floor(cachedScore / 3) : 5, 
-        timeliness: cachedScore ? Math.floor(cachedScore / 3) : 5, 
-        category: 'other', 
-        keywords: [] 
-      });
-    } else {
-      newArticles.push({ article, originalIndex: i });
-    }
+): Promise<{ relevance: number; quality: number; timeliness: number; category: CategoryId; keywords: string[]; totalScore: number } | null> {
+  // Check if article already has score in database
+  const cached = db.getArticle(article.link);
+  if (cached && cached.relevance > 0) {
+    return {
+      relevance: cached.relevance,
+      quality: cached.quality,
+      timeliness: cached.timeliness,
+      category: cached.category,
+      keywords: cached.keywords,
+      totalScore: cached.score,
+    };
   }
-  
-  console.log(`[digest] ${newArticles.length} new articles to score (${articles.length - newArticles.length} cached)`);
-  
-  if (newArticles.length === 0) {
-    return allScores;
-  }
-  
-  // Process new articles in batches
-  const indexed = newArticles.map(({ article, originalIndex }, batchIndex) => ({
-    batchIndex,
-    originalIndex,
-    title: article.title,
-    description: article.description,
-    sourceName: article.sourceName,
-    link: article.link,
-  }));
-  
-  const batches: typeof indexed[] = [];
-  for (let i = 0; i < indexed.length; i += GEMINI_BATCH_SIZE) {
-    batches.push(indexed.slice(i, i + GEMINI_BATCH_SIZE));
-  }
-  
-  console.log(`[digest] AI scoring: ${newArticles.length} new articles in ${batches.length} batches`);
   
   const validCategories = new Set<string>(['ai-ml', 'security', 'engineering', 'tools', 'opinion', 'other']);
   
-  // Process batches sequentially (MAX_CONCURRENT_GEMINI = 1)
-  for (let i = 0; i < batches.length; i++) {
-    const batch = batches[i];
-    try {
-      const prompt = buildScoringPrompt(batch);
-      const responseText = await aiClient.call(prompt);
-      const parsed = parseJsonResponse<GeminiScoringResult>(responseText);
-      
-      if (parsed.results && Array.isArray(parsed.results)) {
-        for (const result of parsed.results) {
-          const clamp = (v: number) => Math.min(10, Math.max(1, Math.round(v)));
-          const cat = (validCategories.has(result.category) ? result.category : 'other') as CategoryId;
-          const scoreData = {
-            relevance: clamp(result.relevance),
-            quality: clamp(result.quality),
-            timeliness: clamp(result.timeliness),
-            category: cat,
-            keywords: Array.isArray(result.keywords) ? result.keywords.slice(0, 4) : [],
-          };
-          
-          // Find the original index
-          const batchItem = batch.find(b => b.batchIndex === result.index);
-          if (batchItem) {
-            allScores.set(batchItem.originalIndex, scoreData);
-            
-            // Save to database immediately
-            const totalScore = scoreData.relevance + scoreData.quality + scoreData.timeliness;
-            db.saveArticle(batchItem.link, batchItem.title, batchItem.sourceName, totalScore);
-          }
-        }
-      }
-    } catch (error) {
-      console.warn(`[digest] Scoring batch failed: ${error instanceof Error ? error.message : String(error)}`);
-      for (const item of batch) {
-        allScores.set(item.originalIndex, { relevance: 5, quality: 5, timeliness: 5, category: 'other', keywords: [] });
-      }
-    }
+  try {
+    const prompt = buildSingleScoringPrompt(article);
+    const responseText = await aiClient.call(prompt);
+    const parsed = parseJsonResponse<GeminiScoringResult>(responseText);
     
-    console.log(`[digest] Scoring progress: ${i + 1}/${batches.length} batches`);
+    const clamp = (v: number) => Math.min(10, Math.max(1, Math.round(v)));
+    const cat = (validCategories.has(parsed.category) ? parsed.category : 'other') as CategoryId;
+    const scoreData = {
+      relevance: clamp(parsed.relevance),
+      quality: clamp(parsed.quality),
+      timeliness: clamp(parsed.timeliness),
+      category: cat,
+      keywords: Array.isArray(parsed.keywords) ? parsed.keywords.slice(0, 4) : [],
+      totalScore: clamp(parsed.relevance) + clamp(parsed.quality) + clamp(parsed.timeliness),
+    };
+    
+    // Save to database immediately
+    db.saveArticle(article.link, article.title, article.sourceName, scoreData.totalScore, {
+      relevance: scoreData.relevance,
+      quality: scoreData.quality,
+      timeliness: scoreData.timeliness,
+      category: scoreData.category,
+      keywords: scoreData.keywords,
+    });
+    
+    return scoreData;
+  } catch (error) {
+    console.warn(`[digest] Scoring failed for "${article.title.slice(0, 50)}": ${error instanceof Error ? error.message : String(error)}`);
+    
+    // Save default score
+    const defaultScore = { relevance: 5, quality: 5, timeliness: 5, category: 'other' as CategoryId, keywords: [] as string[], totalScore: 15 };
+    db.saveArticle(article.link, article.title, article.sourceName, defaultScore.totalScore, {
+      relevance: defaultScore.relevance,
+      quality: defaultScore.quality,
+      timeliness: defaultScore.timeliness,
+      category: defaultScore.category,
+      keywords: defaultScore.keywords,
+    });
+    
+    return defaultScore;
   }
-  
-  return allScores;
 }
 
 // ============================================================================
-// AI Summarization
+// AI Summarization (Serial - one article at a time)
 // ============================================================================
 
-function buildSummaryPrompt(
-  articles: Array<{ index: number; title: string; description: string; sourceName: string; link: string }>,
-  lang: 'zh' | 'en'
-): string {
-  const articlesList = articles.map(a =>
-    `Index ${a.index}: [${a.sourceName}] ${a.title}\nURL: ${a.link}\n${a.description.slice(0, 800)}`
-  ).join('\n\n---\n\n');
-
+function buildSingleSummaryPrompt(article: { title: string; description: string; sourceName: string; link: string }, lang: 'zh' | 'en'): string {
   const langInstruction = lang === 'zh'
     ? '请用中文撰写摘要和推荐理由。如果原文是英文，请翻译为中文。标题翻译也用中文。'
     : 'Write summaries, reasons, and title translations in English.';
@@ -832,71 +891,81 @@ ${langInstruction}
 
 ## 待摘要文章
 
-${articlesList}
+[${article.sourceName}] ${article.title}
+URL: ${article.link}
+${article.description.slice(0, 800)}
 
 请严格按 JSON 格式返回：
 {
-  "results": [
-    {
-      "index": 0,
-      "titleZh": "中文翻译的标题",
-      "summary": "摘要内容...",
-      "reason": "推荐理由..."
-    }
-  ]
+  "titleZh": "中文翻译的标题",
+  "summary": "摘要内容...",
+  "reason": "推荐理由..."
 }`;
 }
 
-async function summarizeArticles(
-  articles: Array<Article & { index: number }>,
+async function summarizeSingleArticle(
+  article: Article,
   aiClient: AIClient,
+  db: DigestDatabase,
   lang: 'zh' | 'en'
-): Promise<Map<number, { titleZh: string; summary: string; reason: string }>> {
-  const summaries = new Map<number, { titleZh: string; summary: string; reason: string }>();
-  
-  const indexed = articles.map(a => ({
-    index: a.index,
-    title: a.title,
-    description: a.description,
-    sourceName: a.sourceName,
-    link: a.link,
-  }));
-  
-  const batches: typeof indexed[] = [];
-  for (let i = 0; i < indexed.length; i += GEMINI_BATCH_SIZE) {
-    batches.push(indexed.slice(i, i + GEMINI_BATCH_SIZE));
+): Promise<{ titleZh: string; summary: string; reason: string }> {
+  // Check if article already has summary in database
+  const cached = db.getArticle(article.link);
+  if (cached && cached.summary) {
+    return {
+      titleZh: cached.titleZh,
+      summary: cached.summary,
+      reason: cached.reason,
+    };
   }
   
-  console.log(`[digest] Generating summaries for ${articles.length} articles in ${batches.length} batches`);
-  
-  // Process batches sequentially (MAX_CONCURRENT_GEMINI = 1)
-  for (let i = 0; i < batches.length; i++) {
-    const batch = batches[i];
-    try {
-      const prompt = buildSummaryPrompt(batch, lang);
-      const responseText = await aiClient.call(prompt);
-      const parsed = parseJsonResponse<GeminiSummaryResult>(responseText);
-      
-      if (parsed.results && Array.isArray(parsed.results)) {
-        for (const result of parsed.results) {
-          summaries.set(result.index, {
-            titleZh: result.titleZh || '',
-            summary: result.summary || '',
-            reason: result.reason || '',
-          });
-        }
-      }
-    } catch (error) {
-      console.warn(`[digest] Summary batch failed: ${error instanceof Error ? error.message : String(error)}`);
-      for (const item of batch) {
-        summaries.set(item.index, { titleZh: item.title, summary: item.title, reason: '' });
-      }
-    }
+  try {
+    const prompt = buildSingleSummaryPrompt(article, lang);
+    const responseText = await aiClient.call(prompt);
+    const parsed = parseJsonResponse<GeminiSummaryResult>(responseText);
     
-    console.log(`[digest] Summary progress: ${i + 1}/${batches.length} batches`);
+    const result = {
+      titleZh: parsed.titleZh || article.title,
+      summary: parsed.summary || article.description.slice(0, 200),
+      reason: parsed.reason || '',
+    };
+    
+    // Update database with summary
+    db.saveArticle(article.link, article.title, article.sourceName, cached?.score || 0, {
+      relevance: cached?.relevance,
+      quality: cached?.quality,
+      timeliness: cached?.timeliness,
+      category: cached?.category,
+      keywords: cached?.keywords,
+      titleZh: result.titleZh,
+      summary: result.summary,
+      reason: result.reason,
+    });
+    
+    return result;
+  } catch (error) {
+    console.warn(`[digest] Summary failed for "${article.title.slice(0, 50)}": ${error instanceof Error ? error.message : String(error)}`);
+    
+    const fallback = {
+      titleZh: article.title,
+      summary: article.description.slice(0, 200),
+      reason: '',
+    };
+    
+    // Update database with fallback
+    db.saveArticle(article.link, article.title, article.sourceName, cached?.score || 0, {
+      relevance: cached?.relevance,
+      quality: cached?.quality,
+      timeliness: cached?.timeliness,
+      category: cached?.category,
+      keywords: cached?.keywords,
+      titleZh: fallback.titleZh,
+      summary: fallback.summary,
+      reason: fallback.reason,
+    });
+    
+    return fallback;
   }
-  
-  return summaries;
 }
 
 // ============================================================================
@@ -1160,7 +1229,7 @@ function generateDigestReport(articles: ScoredArticle[], highlights: string, sta
 
   // ── Footer ──
   report += `*生成于 ${dateStr} ${now.toISOString().split('T')[1]?.slice(0, 5) || ''} | 扫描 ${stats.successFeeds} 源 → 获取 ${stats.totalArticles} 篇 → 精选 ${articles.length} 篇*\n`;
-  report += `*基于 [Hacker News Popularity Contest 2025](https://refactoringenglish.com/tools/hn-popularity/) RSS 源列表，由 [Andrej Karpathy](https://x.com/karpathy) 推荐*\n`;
+  report += `*基于 [Hacker News Popularity Contest 2025](https://refactoringenglish.com/tools/hn-popularity/) RSS 源列表，由 [Andrej Karpathy](https://x.github.com/karpathy) 推荐*\n`;
   report += `*由「懂点儿AI」制作，欢迎关注同名微信公众号获取更多 AI 实用技巧 💡*\n`;
 
   return report;
@@ -1258,82 +1327,137 @@ async function main(): Promise<void> {
   }
   console.log('');
   
-  console.log(`[digest] Step 1/5: Fetching ${RSS_FEEDS.length} RSS feeds (batch size: ${FEED_BATCH_SIZE}, delay: ${FEED_BATCH_DELAY_MS}ms)...`);
-  const allArticles = await fetchAllFeeds(RSS_FEEDS, db);
+  const cutoffTime = new Date(Date.now() - hours * 60 * 60 * 1000);
   
-  if (allArticles.length === 0) {
-    console.error('[digest] Error: No articles fetched from any feed. Check network connection.');
-    db.close();
-    process.exit(1);
+  // Step 1: Fetch RSS feeds serially, process articles immediately
+  console.log(`[digest] Step 1/5: Fetching ${RSS_FEEDS.length} RSS feeds (serial mode)...`);
+  
+  let totalArticles = 0;
+  let newArticles = 0;
+  let cachedArticles = 0;
+  let successFeeds = 0;
+  const processedSources = new Set<string>();
+  
+  for await (const { article, isNew } of fetchAllFeedsSerial(RSS_FEEDS, db, cutoffTime)) {
+    totalArticles++;
+    processedSources.add(article.sourceName);
+    if (isNew) {
+      newArticles++;
+    } else {
+      cachedArticles++;
+    }
+    // Article is processed immediately, not stored in memory
   }
   
-  console.log(`[digest] Step 2/5: Filtering by time range (${hours} hours)...`);
-  const cutoffTime = new Date(Date.now() - hours * 60 * 60 * 1000);
-  const recentArticles = allArticles.filter(a => a.pubDate.getTime() > cutoffTime.getTime());
+  successFeeds = processedSources.size;
   
-  console.log(`[digest] Found ${recentArticles.length} articles within last ${hours} hours`);
+  console.log(`[digest] Step 2/5: Articles within time range: ${totalArticles} (${newArticles} new, ${cachedArticles} cached)`);
   
-  if (recentArticles.length === 0) {
+  if (totalArticles === 0) {
     console.error(`[digest] Error: No articles found within the last ${hours} hours.`);
     console.error(`[digest] Try increasing --hours (e.g., --hours 168 for one week)`);
     db.close();
     process.exit(1);
   }
   
-  console.log(`[digest] Step 3/5: AI scoring ${recentArticles.length} articles (checking database for cached scores)...`);
-  const scores = await scoreArticlesWithAI(recentArticles, aiClient, db);
+  // Step 3: Score articles serially - one by one
+  console.log(`[digest] Step 3/5: AI scoring articles (serial mode, one at a time)...`);
   
-  const scoredArticles = recentArticles.map((article, index) => {
-    const score = scores.get(index) || { relevance: 5, quality: 5, timeliness: 5, category: 'other' as CategoryId, keywords: [] };
-    return {
-      ...article,
-      totalScore: score.relevance + score.quality + score.timeliness,
-      breakdown: score,
-    };
-  });
+  // Get all recent articles from database that need scoring
+  const recentArticlesFromDb = db.getRecentArticles(cutoffTime.getTime());
+  let scoredCount = 0;
+  let cachedScoreCount = 0;
   
-  scoredArticles.sort((a, b) => b.totalScore - a.totalScore);
-  const topArticles = scoredArticles.slice(0, topN);
+  for (const article of recentArticlesFromDb) {
+    // Check if already has full score data
+    if (article.relevance > 0) {
+      cachedScoreCount++;
+      continue;
+    }
+    
+    // Score one article at a time
+    const scoreResult = await scoreSingleArticle({
+      title: article.title,
+      link: article.link,
+      pubDate: article.pubDate,
+      description: '',
+      sourceName: article.sourceName,
+      sourceUrl: '',
+    }, aiClient, db);
+    
+    if (scoreResult) {
+      scoredCount++;
+    }
+  }
   
-  console.log(`[digest] Top ${topN} articles selected (score range: ${topArticles[topArticles.length - 1]?.totalScore || 0} - ${topArticles[0]?.totalScore || 0})`);
+  console.log(`[digest] Scored ${scoredCount} new articles, ${cachedScoreCount} used cached scores`);
   
-  console.log(`[digest] Step 4/5: Generating AI summaries...`);
-  const indexedTopArticles = topArticles.map((a, i) => ({ ...a, index: i }));
-  const summaries = await summarizeArticles(indexedTopArticles, aiClient, lang);
+  // Step 4: Get top articles and generate summaries serially
+  console.log(`[digest] Step 4/5: Selecting top ${topN} articles and generating summaries (serial mode)...`);
   
-  const finalArticles: ScoredArticle[] = topArticles.map((a, i) => {
-    const sm = summaries.get(i) || { titleZh: a.title, summary: a.description.slice(0, 200), reason: '' };
-    return {
-      title: a.title,
-      link: a.link,
-      pubDate: a.pubDate,
-      description: a.description,
-      sourceName: a.sourceName,
-      sourceUrl: a.sourceUrl,
-      score: a.totalScore,
+  // Re-fetch all scored articles from database
+  const allScoredArticles = db.getRecentArticles(cutoffTime.getTime())
+    .filter(a => a.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topN);
+  
+  if (allScoredArticles.length === 0) {
+    console.error(`[digest] Error: No scored articles found.`);
+    db.close();
+    process.exit(1);
+  }
+  
+  // Generate summaries serially - one by one
+  const finalArticles: ScoredArticle[] = [];
+  for (let i = 0; i < allScoredArticles.length; i++) {
+    const article = allScoredArticles[i]!;
+    console.log(`[digest] [${i + 1}/${allScoredArticles.length}] Summarizing: ${article.title.slice(0, 50)}...`);
+    
+    // Check if already has summary
+    if (!article.summary) {
+      const summary = await summarizeSingleArticle({
+        title: article.title,
+        link: article.link,
+        pubDate: article.pubDate,
+        description: '',
+        sourceName: article.sourceName,
+        sourceUrl: '',
+      }, aiClient, db, lang);
+      
+      article.titleZh = summary.titleZh;
+      article.summary = summary.summary;
+      article.reason = summary.reason;
+    }
+    
+    finalArticles.push({
+      title: article.title,
+      link: article.link,
+      pubDate: article.pubDate,
+      description: '',
+      sourceName: article.sourceName,
+      sourceUrl: '',
+      score: article.score,
       scoreBreakdown: {
-        relevance: a.breakdown.relevance,
-        quality: a.breakdown.quality,
-        timeliness: a.breakdown.timeliness,
+        relevance: article.relevance,
+        quality: article.quality,
+        timeliness: article.timeliness,
       },
-      category: a.breakdown.category,
-      keywords: a.breakdown.keywords,
-      titleZh: sm.titleZh,
-      summary: sm.summary,
-      reason: sm.reason,
-    };
-  });
+      category: article.category,
+      keywords: article.keywords,
+      titleZh: article.titleZh,
+      summary: article.summary,
+      reason: article.reason,
+    });
+  }
   
   console.log(`[digest] Step 5/5: Generating today's highlights...`);
   const highlights = await generateHighlights(finalArticles, aiClient, lang);
   
-  const successfulSources = new Set(allArticles.map(a => a.sourceName));
-  
   const report = generateDigestReport(finalArticles, highlights, {
     totalFeeds: RSS_FEEDS.length,
-    successFeeds: successfulSources.size,
-    totalArticles: allArticles.length,
-    filteredArticles: recentArticles.length,
+    successFeeds,
+    totalArticles,
+    filteredArticles: totalArticles,
     hours,
     lang,
   });
@@ -1347,7 +1471,7 @@ async function main(): Promise<void> {
   console.log('');
   console.log(`[digest] ✅ Done!`);
   console.log(`[digest] 📁 Report: ${outputPath}`);
-  console.log(`[digest] 📊 Stats: ${successfulSources.size} sources → ${allArticles.length} articles → ${recentArticles.length} recent → ${finalArticles.length} selected`);
+  console.log(`[digest] 📊 Stats: ${successFeeds} sources → ${totalArticles} articles → ${finalArticles.length} selected`);
   
   if (finalArticles.length > 0) {
     console.log('');
