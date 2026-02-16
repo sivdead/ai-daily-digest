@@ -1246,6 +1246,194 @@ function generateDigestReport(articles: ScoredArticle[], highlights: string, sta
 // CLI
 // ============================================================================
 
+// ============================================================================
+// Feishu Card Generation
+// ============================================================================
+
+interface FeishuCard {
+  config: { wide_screen_mode: boolean };
+  header: {
+    template: string;
+    title: { tag: string; content: string };
+  };
+  elements: Array<Record<string, unknown>>;
+}
+
+function generateFeishuCard(digestData: {
+  date: string;
+  highlights: string;
+  topArticles: ScoredArticle[];
+  totalArticles: number;
+  categoryDistribution: Record<string, number>;
+  markdownUrl?: string;
+}): FeishuCard {
+  const elements: Array<Record<string, unknown>> = [];
+
+  // 今日看点
+  if (digestData.highlights) {
+    elements.push({
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: '**📝 今日看点**',
+      },
+    });
+    elements.push({
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: digestData.highlights,
+      },
+    });
+    elements.push({ tag: 'hr' });
+  }
+
+  // Top 3 文章
+  if (digestData.topArticles.length > 0) {
+    elements.push({
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: '**🏆 今日必读 Top 3**',
+      },
+    });
+
+    for (let i = 0; i < Math.min(3, digestData.topArticles.length); i++) {
+      const article = digestData.topArticles[i];
+      const medal = ['🥇', '🥈', '🥉'][i];
+      const catMeta = CATEGORY_META[article.category];
+      const scoreTotal = article.scoreBreakdown.relevance + article.scoreBreakdown.quality + article.scoreBreakdown.timeliness;
+
+      // 文章标题和链接
+      elements.push({
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: `${medal} **[${article.titleZh || article.title}](${article.link})**`,
+        },
+      });
+
+      // 来源、评分、分类
+      elements.push({
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: `📰 ${article.sourceName} · ⭐ ${scoreTotal}/30 · ${catMeta.emoji} ${catMeta.label}`,
+        },
+      });
+
+      // 摘要（截断到 150 字）
+      const summary = article.summary.length > 150 
+        ? article.summary.slice(0, 150) + '...' 
+        : article.summary;
+      elements.push({
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: `> ${summary}`,
+        },
+      });
+
+      // 推荐理由
+      if (article.reason) {
+        elements.push({
+          tag: 'div',
+          text: {
+            tag: 'lark_md',
+            content: `💡 *${article.reason}*`,
+          },
+        });
+      }
+
+      // 关键词
+      if (article.keywords.length > 0) {
+        elements.push({
+          tag: 'div',
+          text: {
+            tag: 'lark_md',
+            content: `🏷️ ${article.keywords.join(', ')}`,
+          },
+        });
+      }
+
+      // 分隔线
+      if (i < Math.min(3, digestData.topArticles.length) - 1) {
+        elements.push({ tag: 'hr' });
+      }
+    }
+
+    elements.push({ tag: 'hr' });
+  }
+
+  // 数据概览
+  elements.push({
+    tag: 'div',
+    text: {
+      tag: 'lark_md',
+      content: '**📊 数据概览**',
+    },
+  });
+
+  elements.push({
+    tag: 'div',
+    text: {
+      tag: 'lark_md',
+      content: `📄 文章总数: ${digestData.totalArticles} 篇`,
+    },
+  });
+
+  // 分类分布
+  const categoryLines = Object.entries(digestData.categoryDistribution)
+    .sort((a, b) => b[1] - a[1])
+    .map(([catId, count]) => {
+      const meta = CATEGORY_META[catId as CategoryId];
+      return `${meta.emoji} ${meta.label}: ${count} 篇`;
+    });
+
+  if (categoryLines.length > 0) {
+    elements.push({
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: categoryLines.join(' · '),
+      },
+    });
+  }
+
+  // 查看完整报告按钮
+  if (digestData.markdownUrl) {
+    elements.push({ tag: 'hr' });
+    elements.push({
+      tag: 'action',
+      actions: [
+        {
+          tag: 'button',
+          text: {
+            tag: 'plain_text',
+            content: '查看完整报告',
+          },
+          type: 'primary',
+          url: digestData.markdownUrl,
+        },
+      ],
+    });
+  }
+
+  return {
+    config: {
+      wide_screen_mode: true,
+    },
+    header: {
+      template: 'blue',
+      title: {
+        tag: 'plain_text',
+        content: `📰 AI 博客每日精选 — ${digestData.date}`,
+      },
+    },
+    elements,
+  };
+}
+
 function printUsage(): never {
   console.log(`AI Daily Digest - AI-powered RSS digest from 90 top tech blogs
 
@@ -1253,11 +1441,13 @@ Usage:
   bun scripts/digest.ts [options]
 
 Options:
-  --hours <n>     Time range in hours (default: 48)
-  --top-n <n>     Number of top articles to include (default: 15)
-  --lang <lang>   Summary language: zh or en (default: zh)
-  --output <path> Output file path (default: ./digest-YYYYMMDD.md)
-  --help          Show this help
+  --hours <n>       Time range in hours (default: 48)
+  --top-n <n>       Number of top articles to include (default: 15)
+  --lang <lang>     Summary language: zh or en (default: zh)
+  --output <path>   Output file path (default: ./digest-YYYYMMDD.md)
+  --feishu-card     Output Feishu card JSON to stdout (or specify file with --feishu-card-output)
+  --feishu-card-output <path>  Output file for Feishu card JSON
+  --help            Show this help
 
 Environment:
   OPENROUTER_API_KEY  Required. Get one at https://openrouter.ai/keys
@@ -1269,6 +1459,7 @@ Environment:
 Examples:
   bun scripts/digest.ts --hours 24 --top-n 10 --lang zh
   bun scripts/digest.ts --hours 72 --top-n 20 --lang en --output ./my-digest.md
+  bun scripts/digest.ts --hours 24 --top-n 10 --lang zh --output /tmp/digest.md --feishu-card
 `);
   process.exit(0);
 }
@@ -1281,6 +1472,8 @@ async function main(): Promise<void> {
   let topN = 15;
   let lang: 'zh' | 'en' = 'zh';
   let outputPath = '';
+  let feishuCardOutput: string | null = null;
+  let feishuCardEnabled = false;
   
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
@@ -1292,6 +1485,11 @@ async function main(): Promise<void> {
       lang = args[++i] as 'zh' | 'en';
     } else if (arg === '--output' && args[i + 1]) {
       outputPath = args[++i]!;
+    } else if (arg === '--feishu-card') {
+      feishuCardEnabled = true;
+    } else if (arg === '--feishu-card-output' && args[i + 1]) {
+      feishuCardOutput = args[++i]!;
+      feishuCardEnabled = true;
     }
   }
   
@@ -1320,6 +1518,9 @@ async function main(): Promise<void> {
     const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
     outputPath = `./digest-${dateStr}.md`;
   }
+  
+  // Define date string for Feishu card
+  const dateStr = outputPath.match(/(\d{4}-\d{2}-\d{2})/)?.[0] || new Date().toISOString().slice(0, 10);
   
   console.log(`[digest] === AI Daily Digest ===`);
   console.log(`[digest] Database: ${DB_PATH}`);
@@ -1472,6 +1673,47 @@ async function main(): Promise<void> {
   
   await mkdir(dirname(outputPath), { recursive: true });
   await writeFile(outputPath, report);
+  
+  // Generate Feishu Card if enabled
+  if (feishuCardEnabled) {
+    console.log('');
+    console.log(`[digest] Generating Feishu card...`);
+    
+    // Calculate category distribution
+    const categoryDistribution: Record<string, number> = {};
+    for (const article of finalArticles) {
+      categoryDistribution[article.category] = (categoryDistribution[article.category] || 0) + 1;
+    }
+    
+    // Create markdown URL (use file:// protocol for local files, or assume http if remote)
+    const markdownUrl = outputPath.startsWith('http') 
+      ? outputPath 
+      : `file://${outputPath}`;
+    
+    const feishuCard = generateFeishuCard({
+      date: dateStr,
+      highlights,
+      topArticles: finalArticles.slice(0, 3),
+      totalArticles: finalArticles.length,
+      categoryDistribution,
+      markdownUrl,
+    });
+    
+    const cardJson = JSON.stringify(feishuCard, null, 2);
+    
+    if (feishuCardOutput) {
+      // Write to file
+      await mkdir(dirname(feishuCardOutput), { recursive: true });
+      await writeFile(feishuCardOutput, cardJson);
+      console.log(`[digest] Feishu card saved to: ${feishuCardOutput}`);
+    } else {
+      // Output to stdout
+      console.log('');
+      console.log('=== FEISHU CARD JSON ===');
+      console.log(cardJson);
+      console.log('=== END FEISHU CARD JSON ===');
+    }
+  }
   
   // Close database
   db.close();
