@@ -205,7 +205,7 @@ class DigestDatabase {
     `);
 
     // Articles table
-    this.db.db.exec(`
+    this.db.exec(`
       CREATE TABLE IF NOT EXISTS articles (
         url TEXT PRIMARY KEY,
         title TEXT,
