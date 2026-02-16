@@ -11,6 +11,7 @@ import { join } from 'node:path';
 
 const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
 const OPENROUTER_MODEL = 'google/gemini-2.5-flash-lite';  // or google/gemini-3-flash-preview
+const OPENAI_DEFAULT_API_BASE = 'https://api.openai.com/v1';
 const FEED_FETCH_TIMEOUT_MS = 15_000;
 
 const DB_DIR = join(homedir(), '.hn-daily-digest');
