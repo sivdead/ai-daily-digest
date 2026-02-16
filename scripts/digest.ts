@@ -1,4 +1,4 @@
-import { writeFile, mkdir } from 'node:fs/promises';
+import { writeFile, mkdir, readFile, access } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import process from 'node:process';
 import { Database } from 'bun:sqlite';
@@ -17,6 +17,7 @@ const FEED_FETCH_TIMEOUT_MS = 15_000;
 
 const DB_DIR = join(homedir(), '.hn-daily-digest');
 const DB_PATH = join(DB_DIR, 'digest.db');
+const CONFIG_PATH = join(DB_DIR, 'config.json');
 
 // 90 RSS feeds from Hacker News Popularity Contest 2025 (curated by Karpathy)
 const RSS_FEEDS: Array<{ name: string; xmlUrl: string; htmlUrl: string }> = [
@@ -168,6 +169,64 @@ interface GeminiSummaryResult {
 
 interface AIClient {
   call(prompt: string): Promise<string>;
+}
+
+interface Config {
+  hours: number;
+  topN: number;
+  lang: 'zh' | 'en';
+  outputFormat: 'markdown' | 'feishu-card' | 'both';
+  outputPath: string;
+  feishuWebhook: string;
+  feishuUserId: string;
+}
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+const DEFAULT_CONFIG: Config = {
+  hours: 48,
+  topN: 15,
+  lang: 'zh',
+  outputFormat: 'markdown',
+  outputPath: '',
+  feishuWebhook: '',
+  feishuUserId: '',
+};
+
+async function loadConfig(): Promise<Config> {
+  const config: Config = { ...DEFAULT_CONFIG };
+  
+  try {
+    // Check if config file exists
+    await access(CONFIG_PATH);
+    const content = await readFile(CONFIG_PATH, 'utf-8');
+    const parsed = JSON.parse(content) as Partial<Config>;
+    
+    // Merge with defaults
+    if (parsed.hours !== undefined) config.hours = parsed.hours;
+    if (parsed.topN !== undefined) config.topN = parsed.topN;
+    if (parsed.lang !== undefined && (parsed.lang === 'zh' || parsed.lang === 'en')) config.lang = parsed.lang;
+    if (parsed.outputFormat !== undefined && ['markdown', 'feishu-card', 'both'].includes(parsed.outputFormat)) {
+      config.outputFormat = parsed.outputFormat;
+    }
+    if (parsed.outputPath !== undefined) config.outputPath = parsed.outputPath;
+    if (parsed.feishuWebhook !== undefined) config.feishuWebhook = parsed.feishuWebhook;
+    if (parsed.feishuUserId !== undefined) config.feishuUserId = parsed.feishuUserId;
+    
+    console.log(`[digest] Loaded config from: ${CONFIG_PATH}`);
+  } catch {
+    // Config file doesn't exist, use defaults
+    console.log(`[digest] No config file found at ${CONFIG_PATH}, using defaults`);
+  }
+  
+  return config;
+}
+
+async function saveConfig(config: Config): Promise<void> {
+  await mkdir(DB_DIR, { recursive: true });
+  await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2));
 }
 
 // ============================================================================
@@ -1243,10 +1302,6 @@ function generateDigestReport(articles: ScoredArticle[], highlights: string, sta
 }
 
 // ============================================================================
-// CLI
-// ============================================================================
-
-// ============================================================================
 // Feishu Card Generation
 // ============================================================================
 
@@ -1434,6 +1489,44 @@ function generateFeishuCard(digestData: {
   };
 }
 
+// ============================================================================
+// Feishu Webhook
+// ============================================================================
+
+async function sendFeishuCard(webhookUrl: string, card: FeishuCard, userId?: string): Promise<void> {
+  const payload: Record<string, unknown> = {
+    msg_type: 'interactive',
+    card,
+  };
+
+  // If userId is provided, send to specific user
+  if (userId) {
+    payload.open_id = userId;
+  }
+
+  const response = await fetch(webhookUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => 'Unknown error');
+    throw new Error(`Feishu webhook error (${response.status}): ${errorText}`);
+  }
+
+  const data = await response.json() as { code?: number; msg?: string };
+  if (data.code !== 0 && data.code !== undefined) {
+    throw new Error(`Feishu API error: ${data.msg || 'Unknown error'} (code: ${data.code})`);
+  }
+}
+
+// ============================================================================
+// CLI
+// ============================================================================
+
 function printUsage(): never {
   console.log(`AI Daily Digest - AI-powered RSS digest from 90 top tech blogs
 
@@ -1441,25 +1534,40 @@ Usage:
   bun scripts/digest.ts [options]
 
 Options:
-  --hours <n>       Time range in hours (default: 48)
-  --top-n <n>       Number of top articles to include (default: 15)
-  --lang <lang>     Summary language: zh or en (default: zh)
+  --hours <n>       Time range in hours (default: 48, from config)
+  --top-n <n>       Number of top articles to include (default: 15, from config)
+  --lang <lang>     Summary language: zh or en (default: zh, from config)
   --output <path>   Output file path (default: ./digest-YYYYMMDD.md)
-  --feishu-card     Output Feishu card JSON to stdout (or specify file with --feishu-card-output)
-  --feishu-card-output <path>  Output file for Feishu card JSON
+  --output-format <format>  Output format: markdown | feishu-card | both (default: markdown, from config)
+  --feishu-webhook <url>    Feishu bot webhook URL (from config)
+  --feishu-user-id <id>     Feishu target user ID (from config)
+  --save-config     Save current options to config file
   --help            Show this help
+
+Configuration:
+  Config file: ~/.hn-daily-digest/config.json
+  
+  Config options:
+    hours          - Default time range in hours
+    topN           - Default number of articles
+    lang           - Default language (zh/en)
+    outputFormat   - Default output format (markdown/feishu-card/both)
+    outputPath     - Default output path
+    feishuWebhook  - Feishu bot webhook URL for auto-push
+    feishuUserId   - Feishu target user ID for auto-push
 
 Environment:
   OPENROUTER_API_KEY  Required. Get one at https://openrouter.ai/keys
   GEMINI_API_KEY      Optional fallback for direct Gemini API
   OPENAI_API_KEY      Optional fallback for OpenAI-compatible APIs
-  OPENAI_API_BASE  Optional fallback base URL (default: https://api.openai.com/v1)
-  OPENAI_MODEL     Optional fallback model (default: deepseek-chat for DeepSeek base, else gpt-4o-mini)
+  OPENAI_API_BASE     Optional fallback base URL (default: https://api.openai.com/v1)
+  OPENAI_MODEL        Optional fallback model
 
 Examples:
   bun scripts/digest.ts --hours 24 --top-n 10 --lang zh
   bun scripts/digest.ts --hours 72 --top-n 20 --lang en --output ./my-digest.md
-  bun scripts/digest.ts --hours 24 --top-n 10 --lang zh --output /tmp/digest.md --feishu-card
+  bun scripts/digest.ts --output-format both --feishu-webhook https://open.feishu.cn/...
+  bun scripts/digest.ts --hours 24 --top-n 10 --save-config  # Save defaults
 `);
   process.exit(0);
 }
@@ -1468,12 +1576,17 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   if (args.includes('--help') || args.includes('-h')) printUsage();
   
-  let hours = 48;
-  let topN = 15;
-  let lang: 'zh' | 'en' = 'zh';
-  let outputPath = '';
-  let feishuCardOutput: string | null = null;
-  let feishuCardEnabled = false;
+  // Load config from file
+  const config = await loadConfig();
+  
+  let hours = config.hours;
+  let topN = config.topN;
+  let lang: 'zh' | 'en' = config.lang;
+  let outputPath = config.outputPath;
+  let outputFormat = config.outputFormat;
+  let feishuWebhook = config.feishuWebhook;
+  let feishuUserId = config.feishuUserId;
+  let saveConfigFlag = false;
   
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
@@ -1485,12 +1598,35 @@ async function main(): Promise<void> {
       lang = args[++i] as 'zh' | 'en';
     } else if (arg === '--output' && args[i + 1]) {
       outputPath = args[++i]!;
-    } else if (arg === '--feishu-card') {
-      feishuCardEnabled = true;
-    } else if (arg === '--feishu-card-output' && args[i + 1]) {
-      feishuCardOutput = args[++i]!;
-      feishuCardEnabled = true;
+    } else if (arg === '--output-format' && args[i + 1]) {
+      const format = args[++i]!;
+      if (['markdown', 'feishu-card', 'both'].includes(format)) {
+        outputFormat = format as 'markdown' | 'feishu-card' | 'both';
+      }
+    } else if (arg === '--feishu-webhook' && args[i + 1]) {
+      feishuWebhook = args[++i]!;
+    } else if (arg === '--feishu-user-id' && args[i + 1]) {
+      feishuUserId = args[++i]!;
+    } else if (arg === '--save-config') {
+      saveConfigFlag = true;
     }
+  }
+  
+  // Save config if requested
+  if (saveConfigFlag) {
+    const newConfig: Config = {
+      hours,
+      topN,
+      lang,
+      outputFormat,
+      outputPath,
+      feishuWebhook,
+      feishuUserId,
+    };
+    await saveConfig(newConfig);
+    console.log(`[digest] Config saved to: ${CONFIG_PATH}`);
+    console.log(`[digest] Config:`, JSON.stringify(newConfig, null, 2));
+    return;
   }
   
   const geminiApiKey = process.env.OPENROUTER_API_KEY || process.env.GEMINI_API_KEY;
@@ -1514,6 +1650,7 @@ async function main(): Promise<void> {
     openaiModel,
   });
   
+  // Set default output path if not specified
   if (!outputPath) {
     const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
     outputPath = `./digest-${dateStr}.md`;
@@ -1524,10 +1661,18 @@ async function main(): Promise<void> {
   
   console.log(`[digest] === AI Daily Digest ===`);
   console.log(`[digest] Database: ${DB_PATH}`);
+  console.log(`[digest] Config: ${CONFIG_PATH}`);
   console.log(`[digest] Time range: ${hours} hours`);
   console.log(`[digest] Top N: ${topN}`);
   console.log(`[digest] Language: ${lang}`);
+  console.log(`[digest] Output format: ${outputFormat}`);
   console.log(`[digest] Output: ${outputPath}`);
+  if (feishuWebhook) {
+    console.log(`[digest] Feishu webhook: ${feishuWebhook.slice(0, 30)}...`);
+    if (feishuUserId) {
+      console.log(`[digest] Feishu user ID: ${feishuUserId}`);
+    }
+  }
   console.log(`[digest] AI provider: ${process.env.OPENROUTER_API_KEY ? 'OpenRouter (Gemini via OpenRouter)' : geminiApiKey ? 'Gemini (primary)' : 'OpenAI-compatible (primary)'}`);
   if (openaiApiKey) {
     const resolvedBase = (openaiApiBase?.trim() || OPENAI_DEFAULT_API_BASE).replace(/\/+$/, '');
@@ -1662,20 +1807,26 @@ async function main(): Promise<void> {
   console.log(`[digest] Step 5/5: Generating today's highlights...`);
   const highlights = await generateHighlights(finalArticles, aiClient, lang);
   
-  const report = generateDigestReport(finalArticles, highlights, {
-    totalFeeds: RSS_FEEDS.length,
-    successFeeds,
-    totalArticles,
-    filteredArticles: totalArticles,
-    hours,
-    lang,
-  });
+  // Generate markdown report if needed
+  let markdownContent = '';
+  if (outputFormat === 'markdown' || outputFormat === 'both') {
+    markdownContent = generateDigestReport(finalArticles, highlights, {
+      totalFeeds: RSS_FEEDS.length,
+      successFeeds,
+      totalArticles,
+      filteredArticles: totalArticles,
+      hours,
+      lang,
+    });
+    
+    await mkdir(dirname(outputPath), { recursive: true });
+    await writeFile(outputPath, markdownContent);
+    console.log(`[digest] Markdown report saved to: ${outputPath}`);
+  }
   
-  await mkdir(dirname(outputPath), { recursive: true });
-  await writeFile(outputPath, report);
-  
-  // Generate Feishu Card if enabled
-  if (feishuCardEnabled) {
+  // Generate Feishu Card if needed
+  let feishuCard: FeishuCard | null = null;
+  if (outputFormat === 'feishu-card' || outputFormat === 'both') {
     console.log('');
     console.log(`[digest] Generating Feishu card...`);
     
@@ -1690,7 +1841,7 @@ async function main(): Promise<void> {
       ? outputPath 
       : `file://${outputPath}`;
     
-    const feishuCard = generateFeishuCard({
+    feishuCard = generateFeishuCard({
       date: dateStr,
       highlights,
       topArticles: finalArticles.slice(0, 3),
@@ -1699,19 +1850,23 @@ async function main(): Promise<void> {
       markdownUrl,
     });
     
-    const cardJson = JSON.stringify(feishuCard, null, 2);
+    // Send to Feishu if webhook is configured
+    if (feishuWebhook) {
+      try {
+        console.log(`[digest] Sending Feishu card to webhook...`);
+        await sendFeishuCard(feishuWebhook, feishuCard, feishuUserId);
+        console.log(`[digest] ✅ Feishu card sent successfully!`);
+      } catch (error) {
+        console.error(`[digest] ❌ Failed to send Feishu card: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     
-    if (feishuCardOutput) {
-      // Write to file
-      await mkdir(dirname(feishuCardOutput), { recursive: true });
-      await writeFile(feishuCardOutput, cardJson);
-      console.log(`[digest] Feishu card saved to: ${feishuCardOutput}`);
-    } else {
-      // Output to stdout
-      console.log('');
-      console.log('=== FEISHU CARD JSON ===');
-      console.log(cardJson);
-      console.log('=== END FEISHU CARD JSON ===');
+    // Also save card JSON to file if output path is specified
+    if (outputPath) {
+      const cardOutputPath = outputPath.replace(/\.md$/, '-card.json');
+      const cardJson = JSON.stringify(feishuCard, null, 2);
+      await writeFile(cardOutputPath, cardJson);
+      console.log(`[digest] Feishu card JSON saved to: ${cardOutputPath}`);
     }
   }
   
@@ -1720,7 +1875,9 @@ async function main(): Promise<void> {
   
   console.log('');
   console.log(`[digest] ✅ Done!`);
-  console.log(`[digest] 📁 Report: ${outputPath}`);
+  if (outputFormat === 'markdown' || outputFormat === 'both') {
+    console.log(`[digest] 📁 Report: ${outputPath}`);
+  }
   console.log(`[digest] 📊 Stats: ${successFeeds} sources → ${totalArticles} articles → ${finalArticles.length} selected`);
   
   if (finalArticles.length > 0) {

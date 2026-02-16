@@ -1,0 +1,9 @@
+{
+  "hours": 48,
+  "topN": 15,
+  "lang": "zh",
+  "outputFormat": "markdown",
+  "outputPath": "",
+  "feishuWebhook": "",
+  "feishuUserId": ""
+}

@@ -30,11 +30,43 @@ Agent 会依次询问：
 ### 直接命令行运行
 
 ```bash
-export GEMINI_API_KEY="your-key"
+export OPENROUTER_API_KEY="your-key"
 export OPENAI_API_KEY="your-openai-compatible-key"  # 可选，Gemini 失败时兜底
 export OPENAI_API_BASE="https://api.deepseek.com/v1" # 可选，默认 https://api.openai.com/v1
 export OPENAI_MODEL="deepseek-chat"                  # 可选，不填会自动推断
 npx -y bun scripts/digest.ts --hours 48 --top-n 15 --lang zh --output ./digest.md
+```
+
+### 配置文件
+
+配置文件位于 `~/.hn-daily-digest/config.json`，支持以下选项：
+
+```json
+{
+  "hours": 48,
+  "topN": 15,
+  "lang": "zh",
+  "outputFormat": "markdown",
+  "outputPath": "",
+  "feishuWebhook": "",
+  "feishuUserId": ""
+}
+```
+
+| 配置项 | 说明 | 可选值 |
+|--------|------|--------|
+| `hours` | 时间范围（小时） | 任意正整数 |
+| `topN` | 精选文章数量 | 任意正整数 |
+| `lang` | 输出语言 | `"zh"` / `"en"` |
+| `outputFormat` | 输出格式 | `"markdown"` / `"feishu-card"` / `"both"` |
+| `outputPath` | 输出文件路径 | 文件路径，默认 `./digest-YYYYMMDD.md` |
+| `feishuWebhook` | 飞书机器人 webhook 地址 | 可选，配置后自动发送卡片 |
+| `feishuUserId` | 飞书推送目标用户 ID | 可选 |
+
+**保存配置：**
+
+```bash
+bun scripts/digest.ts --hours 24 --top-n 10 --lang zh --output-format both --save-config
 ```
 
 ## 功能
@@ -62,6 +94,59 @@ RSS 抓取 → 时间过滤 → AI 评分+分类 → AI 摘要+翻译 → 趋势
 | 📊 数据概览 | 统计表格 + Mermaid 饼图（分类分布）+ Mermaid 柱状图（高频关键词）+ ASCII 纯文本图 + 话题标签云 |
 | 分类文章列表 | 按 6 大分类分组，每篇含中文标题、来源、相对时间、评分、摘要、关键词 |
 
+### 飞书卡片推送
+
+支持将日报以飞书卡片形式推送到指定群组或个人：
+
+```bash
+# 方式1：命令行指定 webhook
+bun scripts/digest.ts --feishu-webhook "https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
+
+# 方式2：配置文件中设置 webhook
+bun scripts/digest.ts --output-format both --feishu-webhook "https://open.feishu.cn/open-apis/bot/v2/hook/xxx" --save-config
+
+# 方式3：仅输出卡片 JSON
+bun scripts/digest.ts --output-format feishu-card
+```
+
+**飞书卡片特性：**
+- 📱 移动端友好的卡片布局
+- 🏆 Top 3 文章重点展示
+- 📊 数据概览和分类统计
+- 🔗 一键查看完整报告按钮
+
+**获取飞书 Webhook：**
+1. 在飞书群组中添加自定义机器人
+2. 复制机器人的 webhook 地址
+3. 配置到 `feishuWebhook` 或命令行参数
+
+### 飞书卡片包装脚本（可选）
+
+如果你希望将 Markdown 输出转换为飞书卡片格式，可以使用独立的包装脚本：
+
+```bash
+# 1. 生成 Markdown 日报
+bun scripts/digest.ts --output /tmp/digest.md
+
+# 2. 转换为飞书卡片 JSON
+bun scripts/feishu-card.ts --input /tmp/digest.md --output /tmp/card.json
+
+# 3. 直接发送到飞书（需要 webhook）
+bun scripts/feishu-card.ts --input /tmp/digest.md --webhook "https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
+```
+
+**feishu-card.ts 参数说明：**
+
+| 参数 | 说明 | 示例 |
+|------|------|------|
+| `--input` | Markdown 文件路径（必需） | `/tmp/digest.md` |
+| `--output` | 输出卡片 JSON 文件路径（可选） | `/tmp/card.json` |
+| `--webhook` | 飞书机器人 webhook 地址（可选） | `https://open.feishu.cn/...` |
+| `--user-id` | 推送目标用户 ID（可选） | `ou_xxx` |
+| `--report-url` | 完整报告链接（可选） | `https://example.com/digest.md` |
+
+这个包装脚本将 Markdown 格式的日报转换为飞书卡片 JSON，支持独立使用，与主脚本解耦。
+
 ### 六大分类体系
 
 | 分类 | 覆盖范围 |
@@ -82,30 +167,32 @@ RSS 抓取 → 时间过滤 → AI 评分+分类 → AI 摘要+翻译 → 趋势
 - **智能分类** — AI 自动将文章归入 6 大类别，按类浏览比平铺列表高效得多
 - **趋势洞察** — 不只是文章列表，还会归纳当天技术圈的宏观趋势，帮你把握大方向
 - **配置记忆** — API Key 和偏好参数自动持久化，日常使用一键运行
+- **飞书推送** — 支持自动推送飞书卡片，团队协作更便捷
 
 ## 环境要求
 
 - [Bun](https://bun.sh) 运行时（通过 `npx -y bun` 自动安装）
 - 至少一个可用的 AI API Key：
+  - `OPENROUTER_API_KEY`（推荐，[获取地址](https://openrouter.ai/keys)）
   - `GEMINI_API_KEY`（[免费获取](https://aistudio.google.com/apikey)）
   - 或 `OPENAI_API_KEY`（可配合 `OPENAI_API_BASE` 使用 DeepSeek / OpenAI 等 OpenAI 兼容服务）
 - 网络连接
 
 ## 切换 AI 模型提供商
 
-本项目默认使用 Gemini API（免费），如果你希望替换为其他模型提供商（如 OpenAI、Anthropic、DeepSeek、通义千问等），可以借助 AI 编码助手一键完成。
+本项目默认使用 OpenRouter API（推荐），如果你希望替换为其他模型提供商（如 OpenAI、Anthropic、DeepSeek、通义千问等），可以借助 AI 编码助手一键完成。
 
 ### 方法：让 AI 帮你改
 
 在你使用的 AI 编码工具（如 Claude Code、Cursor、GitHub Copilot 等）中，直接发送以下 prompt：
 
 ```
-请修改 scripts/digest.ts，将 AI 提供商从 Gemini 替换为 [你想用的提供商]。
+请修改 scripts/digest.ts，将 AI 提供商从 OpenRouter 替换为 [你想用的提供商]。
 
 需要修改的部分：
-1. 常量 GEMINI_API_URL（第 9 行）— 替换为目标 API 的 endpoint
+1. 常量 OPENROUTER_API_URL（第 9 行）— 替换为目标 API 的 endpoint
 2. 函数 callGemini（约第 363 行）— 修改 request body 格式和 response 解析逻辑以适配目标 API
-3. 环境变量名 GEMINI_API_KEY — 改为对应的 key 名称（如 OPENAI_API_KEY）
+3. 环境变量名 OPENROUTER_API_KEY — 改为对应的 key 名称（如 OPENAI_API_KEY）
 4. SKILL.md 和 README.md 中的相关说明文字
 
 要求：
@@ -120,7 +207,7 @@ RSS 抓取 → 时间过滤 → AI 评分+分类 → AI 摘要+翻译 → 趋势
 
 | 位置 | 说明 |
 |------|------|
-| `GEMINI_API_URL` 常量 | API endpoint 地址 |
+| `OPENROUTER_API_URL` 常量 | API endpoint 地址 |
 | `callGemini()` 函数 | 请求构造 + 响应解析，约 25 行代码 |
 
 其余所有代码（RSS 抓取、评分 prompt、摘要 prompt、报告生成）均与 AI 提供商无关，无需修改。Prompt 内容本身是通用的，切换模型后可以直接复用。
